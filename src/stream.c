@@ -9,42 +9,151 @@
 #include <stdint.h>
 
 #include <unistd.h>
+#include <unistd.h>
+
+#include <sys/types.h>
+#include <sys/socket.h>
+
+#include <netinet/in.h>
 
 #include "fun.h"
 
 
-/* Read a record from the stream. */
-void fetch_record (int cnx, uint8_t **buf, size_t *buflen) {
+/* Receive a (partial) record from the stream.
+ * Returns 1 when a record is fully loaded, 0 for more to do, -1 for error.
+ */
+static int recv_partial_record (int cnx, uint8_t *buf, size_t *sofar) {
 	size_t minlen = 5;
-	size_t gotlen = 0;
-	size_t rdlen = 1;
-	*buflen = 0;
-	*buf = malloc (5 + 16384);
-	if (!*buf) {
-		perror ("No room for record buffer");
-		return;
+	size_t didlen = *sofar;
+	size_t iolen;
+	printf ("Receiving minlen = %d, didlen = %d, iolen = ???\n", minlen, didlen);
+	if (didlen >= 5) {
+		minlen += (((size_t) buf [3]) << 8) |
+			  (((size_t) buf [4])     );
 	}
-	do {
-		if (rdlen == 0) {
-			fprintf (stderr, "Connection terminated unexpectedly\n");
-			free (*buf);
-			*buf = NULL;
-			return;
-		}
-		rdlen = read (cnx, *buf + gotlen, minlen - gotlen);
-		if (rdlen == -1) {
-			perror ("Receiving failure");
-			free (*buf);
-			*buf = NULL;
-			return;
-		}
-		gotlen += rdlen;
-		if ((minlen == 5) && (gotlen >= 5)) {
-			minlen += (((size_t) (*buf) [3]) << 8) |
-				  (((size_t) (*buf) [4])     );
-		}
-	} while (gotlen < minlen);
-	*buflen = gotlen;
+	printf ("receiving minlen = %d, didlen = %d, iolen = ???\n", minlen, didlen);
+	iolen = read (cnx, buf + didlen, minlen - didlen);
+	printf ("receiving minlen = %d, didlen = %d, iolen = %d\n", minlen, didlen, iolen);
+	if (iolen == -1) {
+		perror ("Communication failure");
+		*sofar = 0;
+		return 0;
+	}
+	*sofar = didlen += iolen;
+	printf ("receiving minlen = %d, didlen = %d, iolen = %d\n", minlen, didlen, iolen);
+	if (didlen >= minlen) {
+		return (minlen > 5);
+	}
+	if (iolen == 0) {
+		fprintf (stderr, "Connection terminated unexpectedly\n");
+		return 0;
+	}
+	return 0;
+}
+
+/* Send a (partial) record from the stream.
+ * Returns 1 when a record is fully loaded, 0 for more to do, -1 for error.
+ */
+static int send_partial_record (int cnx, uint8_t *buf, size_t *sofar, size_t sndlen) {
+	size_t didlen = *sofar;
+	size_t iolen;
+	printf ("Sending sndlen = %d, didlen = %d, iolen = ???\n", sndlen, didlen);
+	iolen = write (cnx, buf + didlen, sndlen - didlen);
+	printf ("sending sndlen = %d, didlen = %d, iolen = %d\n", sndlen, didlen, iolen);
+	if (iolen == -1) {
+		perror ("Communication failure");
+		*sofar = 0;
+		return 0;
+	}
+	*sofar = didlen += iolen;
+	printf ("sending sndlen = %d, didlen = %d, iolen = %d\n", sndlen, didlen, iolen);
+	if (didlen >= sndlen) {
+		return 1;
+	}
+	if (iolen == 0) {
+		fprintf (stderr, "Connection terminated unexpectedly\n");
+		return 0;
+	}
+	return 0;
+}
+
+
+/* Read a (partial) record in the downstream direction.
+ * Updates the proxy's flags to set future reading or writing.
+ */
+void recv_downstream (struct proxy *pxy) {
+	switch (recv_partial_record (pxy->upstream, pxy->dnbuf, &pxy->dnread)) {
+	case 1:
+		pxy->flags &= ~PROXY_FLAG_RECV_DN;
+		pxy->flags |=  PROXY_FLAG_SEND_DN;
+		pxy->dnwritten = 0;
+		//TODO// if (can-send-on-dnstream) send_downstream (pxy);
+		break;
+	case -1:
+		pxy->flags &= ~PROXY_FLAGS_STREAM_DN;
+		pxy->flags |=  PROXY_FLAG_ERROR;
+		break;
+	default:
+		break;
+	}
+}
+
+/* Read a (partial) record in the upstream direction.
+ * Updates the proxy's flags to set future reading or writing.
+ */
+void recv_upstream (struct proxy *pxy) {
+	switch (recv_partial_record (pxy->dnstream, pxy->upbuf, &pxy->upread)) {
+	case 1:
+		pxy->flags &= ~PROXY_FLAG_RECV_UP;
+		pxy->flags |=  PROXY_FLAG_SEND_UP;
+		pxy->upwritten = 0;
+		//TODO// if (can-send-on-upstream) send_upstream (pxy);
+		break;
+	case -1:
+		pxy->flags &= ~PROXY_FLAGS_STREAM_DN;
+		pxy->flags |=  PROXY_FLAG_ERROR;
+		break;
+	default:
+		break;
+	}
+}
+
+
+/* Write a (partial) record in the downstream direction.
+ * Returns 1 when a record has been fully sent, 0 otherwise.
+ */
+int send_downstream (struct proxy *pxy) {
+	switch (send_partial_record (pxy->dnstream, pxy->dnbuf, &pxy->dnwritten, pxy->dnread)) {
+	case 1:
+		pxy->flags &= ~PROXY_FLAG_SEND_DN;
+		pxy->flags |=  PROXY_FLAG_RECV_DN;
+		pxy->dnread = pxy->dnwritten = 0;
+		break;
+	case -1:
+		pxy->flags &= ~PROXY_FLAGS_STREAM_DN;
+		pxy->flags |=  PROXY_FLAG_ERROR;
+	default:
+		break;
+	}
+}
+
+/* Write a (partial) record in the upstream direction.
+ * Returns 1 when a record has been fully sent, 0 otherwise.
+ */
+int send_upstream (struct proxy *pxy) {
+	switch (send_partial_record (pxy->upstream, pxy->upbuf, &pxy->upwritten, pxy->upread)) {
+	case 1:
+		pxy->flags &= ~PROXY_FLAG_SEND_UP;
+		pxy->flags |=  PROXY_FLAG_RECV_UP;
+		pxy->upread = pxy->upwritten = 0;
+		break;
+	case -1:
+		pxy->flags &= ~PROXY_FLAGS_STREAM_DN;
+		pxy->flags |=  PROXY_FLAG_ERROR;
+		break;
+	default:
+		break;
+	}
 }
 
 

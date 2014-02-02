@@ -1,4 +1,4 @@
-/* snitch/main.c -- Main program for SNItch.
+/* snitch/main.c -- Main program for the SNItch daemon.
  *
  * From: Rick van Rein <rick@openfortress.nl>
  */
@@ -11,7 +11,9 @@
 
 #include <sys/types.h>
 #include <sys/socket.h>
+#include <sys/ioctl.h>
 
+#include <fcntl.h>
 #include <errno.h>
 #include <netinet/in.h>
 
@@ -31,6 +33,38 @@ char *setting_cfgfile = "/etc/snitch.conf";
 struct mapping map_kdctun = { NULL,        "kdc.snitch", IN6ADDR_LOOPBACK_INIT, 88 };
 struct mapping map_sshtun = { &map_kdctun, "ssh.snitch", IN6ADDR_LOOPBACK_INIT, 22 };
 struct mapping map_https  = { &map_sshtun, "www.snitch", IN6ADDR_LOOPBACK_INIT, 443 };
+
+
+/* Portable function to set a socket into non-blocking mode.  This is a
+ * requirement for asynchronous communication, especially for the accept()
+ * function which could block if an attempted setup is torn down between
+ * noticing the acticity on the socket and the invocation of accept().
+ *
+ * Source: http://www.kegel.com/dkftpbench/nonblocking.html
+ * Credit: Bjorn Reese
+ */
+
+void socket_unblock (int sox) {
+	int retval;
+#ifdef O_NONBLOCK
+	int flags;
+	// Fix: O_NONBLOCK is defined but broken on SunOS 4.1.x and AIX 3.2.5.
+	flags = fcntl (sox, F_GETFL, 0);
+	if (flags == -1) {
+		flags = 0;
+		fprintf (stderr, "socket_unblock() may expose a bug on SunOS 4.1.x and AIX 3.2.5\n");
+	}
+	// We have O_NONBLOCK, so we use the Posix way to do it
+	retval = fcntl (sox, F_SETFL, flags | O_NONBLOCK);
+#else
+	// In lieu of O_NONBLOCK, we use the old way of doing it
+	flags = 1;
+	retval = ioctl (sox, FIOBIO, &flags);
+#endif
+	if (retval == -1) {
+		fprintf (stderr, "Failed to set socket %d to non-blocking mode.  Race conditions could occur!\n", sox);
+	}
+}
 
 
 /* Connect a client socket for a single connection.
@@ -53,6 +87,7 @@ int connect_downlink (struct proxy *pxy, uint8_t *label, size_t labellen) {
 	pxy->proxymap = map;
 	printf ("Connecting service to downlink\n");
 	pxy->dnstream = socket (AF_INET6, SOCK_STREAM, 0);
+	socket_unblock (pxy->dnstream);
 	if (pxy->dnstream == -1) {
 		return -1;
 	}
@@ -84,13 +119,14 @@ int daemon (int sox) {
 		pxy->upstream = cnx;
 		pxy->dnstream = -1;
 		pxy->upread = pxy->dnwritten = pxy->dnread = pxy->upwritten = 0;
-		pxy->flags = PROXY_FLAG_RECV_DN;
+		init_dnstream_proxy (pxy);
+		socket_unblock (pxy->upstream);
 		//TODO// Synchronous read; moving towards poll()
-		while (pxy->flags & PROXY_FLAG_RECV_DN) {
+		while (proxy_recvs_dnstream (pxy)) {
 			recv_downstream (pxy);
 			printf ("Received %d bytes total downstream\n", pxy->dnread);
 		}
-		if (pxy->flags & PROXY_FLAG_SEND_DN) {
+		if (proxy_sends_dnstream (pxy)) {
 			printf ("Ready to send bytes downstream\n");
 		} else {
 			printf ("NOT ready to send bytes downstream\n");
@@ -98,9 +134,9 @@ int daemon (int sox) {
 		record_label (pxy->dnbuf, pxy->dnread, &label, &labellen);
 		if (label) {
 			if (connect_downlink (pxy, label, labellen) != -1) {
-				pxy->flags |= PROXY_FLAG_RECV_UP;
+				init_upstream_proxy (pxy);
 				//TODO// Sync write; moving towards poll()
-				while (pxy->flags & PROXY_FLAG_SEND_DN) {
+				while (proxy_sends_dnstream (pxy)) {
 					send_downstream (pxy);
 					printf ("Sent %d bytes total downstream\n", pxy->dnwritten);
 				}
@@ -144,6 +180,7 @@ int main (int argc, char *argv []) {
 	// Socket.
 	//
 	sox = socket (AF_INET6, SOCK_STREAM, 0);
+	//TODO:NOTYET,while(accept)...// socket_unblock (sox);
 	if (sox == -1) {
 		perror ("Failed to allocate a server socket");
 		exit (1);

@@ -9,7 +9,7 @@
 #include <stdint.h>
 
 #include <unistd.h>
-#include <unistd.h>
+#include <errno.h>
 
 #include <sys/types.h>
 #include <sys/socket.h>
@@ -35,9 +35,12 @@ static int recv_partial_record (int cnx, uint8_t *buf, size_t *sofar) {
 	iolen = read (cnx, buf + didlen, minlen - didlen);
 	printf ("receiving minlen = %d, didlen = %d, iolen = %d\n", minlen, didlen, iolen);
 	if (iolen == -1) {
+		if ((errno == EWOULDBLOCK) && (errno == EAGAIN)) {
+			return 0;
+		}
 		perror ("Communication failure");
 		*sofar = 0;
-		return 0;
+		return -1;
 	}
 	*sofar = didlen += iolen;
 	printf ("receiving minlen = %d, didlen = %d, iolen = %d\n", minlen, didlen, iolen);
@@ -61,9 +64,12 @@ static int send_partial_record (int cnx, uint8_t *buf, size_t *sofar, size_t snd
 	iolen = write (cnx, buf + didlen, sndlen - didlen);
 	printf ("sending sndlen = %d, didlen = %d, iolen = %d\n", sndlen, didlen, iolen);
 	if (iolen == -1) {
+		if ((errno == EWOULDBLOCK) && (errno == EAGAIN)) {
+			return 0;
+		}
 		perror ("Communication failure");
 		*sofar = 0;
-		return 0;
+		return -1;
 	}
 	*sofar = didlen += iolen;
 	printf ("sending sndlen = %d, didlen = %d, iolen = %d\n", sndlen, didlen, iolen);
@@ -84,14 +90,12 @@ static int send_partial_record (int cnx, uint8_t *buf, size_t *sofar, size_t snd
 void recv_downstream (struct proxy *pxy) {
 	switch (recv_partial_record (pxy->upstream, pxy->dnbuf, &pxy->dnread)) {
 	case 1:
-		pxy->flags &= ~PROXY_FLAG_RECV_DN;
-		pxy->flags |=  PROXY_FLAG_SEND_DN;
+		set_dnstream_proxymode (pxy, PROXY_MODE_SEND);
 		pxy->dnwritten = 0;
 		//TODO// if (can-send-on-dnstream) send_downstream (pxy);
 		break;
 	case -1:
-		pxy->flags &= ~PROXY_FLAGS_STREAM_DN;
-		pxy->flags |=  PROXY_FLAG_ERROR;
+		set_dnstream_proxymode (pxy, PROXY_MODE_ERROR);
 		break;
 	default:
 		break;
@@ -104,14 +108,12 @@ void recv_downstream (struct proxy *pxy) {
 void recv_upstream (struct proxy *pxy) {
 	switch (recv_partial_record (pxy->dnstream, pxy->upbuf, &pxy->upread)) {
 	case 1:
-		pxy->flags &= ~PROXY_FLAG_RECV_UP;
-		pxy->flags |=  PROXY_FLAG_SEND_UP;
+		set_upstream_proxymode (pxy, PROXY_MODE_SEND);
 		pxy->upwritten = 0;
 		//TODO// if (can-send-on-upstream) send_upstream (pxy);
 		break;
 	case -1:
-		pxy->flags &= ~PROXY_FLAGS_STREAM_DN;
-		pxy->flags |=  PROXY_FLAG_ERROR;
+		set_upstream_proxymode (pxy, PROXY_MODE_ERROR);
 		break;
 	default:
 		break;
@@ -125,13 +127,12 @@ void recv_upstream (struct proxy *pxy) {
 int send_downstream (struct proxy *pxy) {
 	switch (send_partial_record (pxy->dnstream, pxy->dnbuf, &pxy->dnwritten, pxy->dnread)) {
 	case 1:
-		pxy->flags &= ~PROXY_FLAG_SEND_DN;
-		pxy->flags |=  PROXY_FLAG_RECV_DN;
+		set_dnstream_proxymode (pxy, PROXY_MODE_RECV);
 		pxy->dnread = pxy->dnwritten = 0;
 		break;
 	case -1:
-		pxy->flags &= ~PROXY_FLAGS_STREAM_DN;
-		pxy->flags |=  PROXY_FLAG_ERROR;
+		set_dnstream_proxymode (pxy, PROXY_MODE_ERROR);
+		break;
 	default:
 		break;
 	}
@@ -143,13 +144,11 @@ int send_downstream (struct proxy *pxy) {
 int send_upstream (struct proxy *pxy) {
 	switch (send_partial_record (pxy->upstream, pxy->upbuf, &pxy->upwritten, pxy->upread)) {
 	case 1:
-		pxy->flags &= ~PROXY_FLAG_SEND_UP;
-		pxy->flags |=  PROXY_FLAG_RECV_UP;
+		set_upstream_proxymode (pxy, PROXY_MODE_RECV);
 		pxy->upread = pxy->upwritten = 0;
 		break;
 	case -1:
-		pxy->flags &= ~PROXY_FLAGS_STREAM_DN;
-		pxy->flags |=  PROXY_FLAG_ERROR;
+		set_upstream_proxymode (pxy, PROXY_MODE_ERROR);
 		break;
 	default:
 		break;

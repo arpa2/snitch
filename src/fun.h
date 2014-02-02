@@ -17,15 +17,21 @@ struct mapping {
 
 #define MAXRECLEN (5 + 16384)
 
-#define PROXY_FLAG_RECV_UP	0x0001
-#define PROXY_FLAG_SEND_UP	0x0002
-#define PROXY_FLAG_RECV_DN	0x0004
-#define PROXY_FLAG_SEND_DN	0x0008
+#define PROXY_MODE_MASK		0x000f
+#define PROXY_MODE_RECV		0x0000
+#define PROXY_MODE_SEND		0x0001
+#define PROXY_MODE_ERROR	0x0003
 
-#define PROXY_FLAG_ERROR	0x0010
+#define set_upstream_proxymode(pxy,m) (((pxy)->upflags = ((pxy)->upflags & ~PROXY_MODE_MASK) | (m)))
+#define set_dnstream_proxymode(pxy,m) (((pxy)->dnflags = ((pxy)->dnflags & ~PROXY_MODE_MASK) | (m)))
 
-#define PROXY_FLAGS_STREAM_UP	( PROXY_FLAG_RECV_UP | PROXY_FLAG_SEND_UP )
-#define PROXY_FLAGS_STREAM_DN	( PROXY_FLAG_RECV_DN | PROXY_FLAG_SEND_DN )
+#define init_dnstream_proxy(pxy) { (pxy)->upflags = PROXY_MODE_RECV; }
+#define init_upstream_proxy(pxy) { (pxy)->upflags = PROXY_MODE_RECV; }
+
+#define proxy_sends_upstream(pxy) (((pxy)->upflags & PROXY_MODE_MASK) == PROXY_MODE_SEND)
+#define proxy_recvs_upstream(pxy) (((pxy)->upflags & PROXY_MODE_MASK) == PROXY_MODE_RECV)
+#define proxy_sends_dnstream(pxy) (((pxy)->dnflags & PROXY_MODE_MASK) == PROXY_MODE_SEND)
+#define proxy_recvs_dnstream(pxy) (((pxy)->dnflags & PROXY_MODE_MASK) == PROXY_MODE_RECV)
 
 
 /* The structure of a bidirectional proxy, upstream & downstream. */
@@ -34,7 +40,7 @@ struct proxy {
 	int upstream, dnstream;
 	size_t upread, dnwritten;
 	size_t dnread, upwritten;
-	uint16_t flags;
+	uint16_t upflags, dnflags;
 	uint8_t upbuf [MAXRECLEN], dnbuf [MAXRECLEN];
 };
 

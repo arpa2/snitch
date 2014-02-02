@@ -37,6 +37,7 @@ struct mapping {
 
 #define proxy_sends(pxy) (((pxy)->flags & PROXY_MODE_MASK) == PROXY_MODE_SEND)
 #define proxy_recvs(pxy) (((pxy)->flags & PROXY_MODE_MASK) == PROXY_MODE_RECV)
+#define proxy_fails(pxy) (((pxy)->flags & PROXY_MODE_MASK) == PROXY_MODE_ERROR)
 #define proxy_side_upstream(pxy) (((pxy)->flags & PROXY_SIDE_UPSTREAM) == PROXY_SIDE_UPSTREAM)
 #define proxy_side_dnstream(pxy) (((pxy)->flags & PROXY_SIDE_UPSTREAM) != PROXY_SIDE_UPSTREAM)
 
@@ -46,6 +47,17 @@ struct mapping {
  * the values to the pollfd structures holding the file descriptors.
  * The peerdix fields couple two one-sided proxy into a bidirectional
  * proxy structure.
+ *
+ * Each proxy side toggles between reading the buffer and passing it on
+ * to the other side.  This is done with one TLS record at a time.  The
+ * proxy therefore is either in sending or receiving mode.  This has an
+ * impact on the underlying file descriptors, but in a slightly complex
+ * manner: Receiving is cleared by setting POLLIN on the same-index
+ * pollfd structure as the proxy, but sending is cleared by setting
+ * POLLOUT on the proxy's peeridx-indexed pollfd structure.  This means
+ * that pollfd structures may actually have POLLIN and POLLOUT set at
+ * the same time, in spite of the either-sending-or-receiving distinction
+ * of each proxy side.
  *
  * Note that freeing pollfd structures may lead to some rearranging of
  * the pollidx and peeridx values, so no further state storage than in
@@ -60,39 +72,23 @@ struct proxy {
 	uint16_t flags;
 	uint8_t rdbuf [MAXRECLEN];
 	size_t read, written;
-	//TODO:DEPRECATE:BIDIRSETTINGS//
-	int upstream, dnstream;
-	size_t upread, dnwritten;
-	size_t dnread, upwritten;
-	uint8_t upbuf [MAXRECLEN], dnbuf [MAXRECLEN];
 };
 
 
 /********** FUNCTIONS **********/
 
 
-/* Read a (partial) record in the downstream direction.
- * Updates the proxy's flags to set future reading or writing.
+/* Receive a TLS record or part of it from the proxy.
+ * Updates the proxy to write state when complete.
  */
-void recv_downstream (struct proxy *pxy);
+void recv_record (int sox, struct proxy *pxy);
 
-/* Read a (partial) record in the upstream direction.
- * Updates the proxy's flags to set future reading or writing.
+/* Write a TLS record (or part of it) to the peering proxy.
+ * Updates the proxy to read state when complete.
  */
-void recv_upstream (struct proxy *pxy);
+void send_record (int sox, struct proxy *pxy);
 
-/* Write a (partial) record in the downstream direction.
- * Returns 1 when a record has been fully sent, 0 otherwise.
- */
-int send_downstream (struct proxy *pxy);
-
-/* Write a (partial) record in the upstream direction.
- * Returns 1 when a record has been fully sent, 0 otherwise.
- */
-int send_upstream (struct proxy *pxy);
-
-
-/* Fetch the label contained in a record */
-void record_label (uint8_t *recbuf, size_t recbuflen, uint8_t **label, size_t *labellen);
+/* Fetch the label contained in the first TLS record */
+void record1_label (uint8_t *recbuf, size_t recbuflen, uint8_t **label, size_t *labellen);
 
 

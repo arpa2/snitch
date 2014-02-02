@@ -49,7 +49,7 @@ static int recv_partial_record (int cnx, uint8_t *buf, size_t *sofar) {
 	}
 	if (iolen == 0) {
 		fprintf (stderr, "Connection terminated unexpectedly\n");
-		return 0;
+		return -1;
 	}
 	return 0;
 }
@@ -78,42 +78,23 @@ static int send_partial_record (int cnx, uint8_t *buf, size_t *sofar, size_t snd
 	}
 	if (iolen == 0) {
 		fprintf (stderr, "Connection terminated unexpectedly\n");
-		return 0;
+		return -1;
 	}
 	return 0;
 }
 
 
-/* Read a (partial) record in the downstream direction.
- * Updates the proxy's flags to set future reading or writing.
+/* Receive a TLS record or part of it from the proxy.
+ * Updates the proxy to write state when complete.
  */
-void recv_downstream (struct proxy *pxy) {
-	switch (recv_partial_record (pxy->upstream, pxy->dnbuf, &pxy->dnread)) {
+void recv_record (int sox, struct proxy *pxy) {
+	switch (recv_partial_record (sox, pxy->rdbuf, &pxy->read)) {
 	case 1:
-		set_dnstream_proxymode (pxy, PROXY_MODE_SEND);
-		pxy->dnwritten = 0;
-		//TODO// if (can-send-on-dnstream) send_downstream (pxy);
+		set_proxymode (pxy, PROXY_MODE_SEND);
+		pxy->written = 0;
 		break;
 	case -1:
-		set_dnstream_proxymode (pxy, PROXY_MODE_ERROR);
-		break;
-	default:
-		break;
-	}
-}
-
-/* Read a (partial) record in the upstream direction.
- * Updates the proxy's flags to set future reading or writing.
- */
-void recv_upstream (struct proxy *pxy) {
-	switch (recv_partial_record (pxy->dnstream, pxy->upbuf, &pxy->upread)) {
-	case 1:
-		set_upstream_proxymode (pxy, PROXY_MODE_SEND);
-		pxy->upwritten = 0;
-		//TODO// if (can-send-on-upstream) send_upstream (pxy);
-		break;
-	case -1:
-		set_upstream_proxymode (pxy, PROXY_MODE_ERROR);
+		set_proxymode (pxy, PROXY_MODE_ERROR);
 		break;
 	default:
 		break;
@@ -121,34 +102,17 @@ void recv_upstream (struct proxy *pxy) {
 }
 
 
-/* Write a (partial) record in the downstream direction.
- * Returns 1 when a record has been fully sent, 0 otherwise.
+/* Write a TLS record (or part of it) to the peering proxy.
+ * Updates the proxy to read state when complete.
  */
-int send_downstream (struct proxy *pxy) {
-	switch (send_partial_record (pxy->dnstream, pxy->dnbuf, &pxy->dnwritten, pxy->dnread)) {
+void send_record (int sox, struct proxy *pxy) {
+	switch (send_partial_record (sox, pxy->rdbuf, &pxy->written, pxy->read)) {
 	case 1:
-		set_dnstream_proxymode (pxy, PROXY_MODE_RECV);
-		pxy->dnread = pxy->dnwritten = 0;
+		set_proxymode (pxy, PROXY_MODE_RECV);
+		pxy->read = pxy->written = 0;
 		break;
 	case -1:
-		set_dnstream_proxymode (pxy, PROXY_MODE_ERROR);
-		break;
-	default:
-		break;
-	}
-}
-
-/* Write a (partial) record in the upstream direction.
- * Returns 1 when a record has been fully sent, 0 otherwise.
- */
-int send_upstream (struct proxy *pxy) {
-	switch (send_partial_record (pxy->upstream, pxy->upbuf, &pxy->upwritten, pxy->upread)) {
-	case 1:
-		set_upstream_proxymode (pxy, PROXY_MODE_RECV);
-		pxy->upread = pxy->upwritten = 0;
-		break;
-	case -1:
-		set_upstream_proxymode (pxy, PROXY_MODE_ERROR);
+		set_proxymode (pxy, PROXY_MODE_ERROR);
 		break;
 	default:
 		break;

@@ -15,6 +15,7 @@
 #include <sys/socket.h>
 #include <sys/ioctl.h>
 
+#include <signal.h>
 #include <poll.h>
 #include <fcntl.h>
 #include <errno.h>
@@ -37,6 +38,7 @@ char *setting_cfgfile = "/etc/snitch.conf";
 
 
 /* Global variables */
+bool interrupted = false;
 struct pollfd *polls = NULL;
 pollidx_t polls_used = 0;
 pollidx_t polls_allocated = 0;
@@ -45,9 +47,11 @@ pollidx_t proxies_allocated = 0;
 #define proxies_used polls_used
 //TODO// Read from configfiles
 //TODO// Use hashing based on label
-struct mapping map_kdctun = { NULL,        "kdc.snitch", IN6ADDR_LOOPBACK_INIT, 88 };
-struct mapping map_sshtun = { &map_kdctun, "ssh.snitch", IN6ADDR_LOOPBACK_INIT, 22 };
-struct mapping map_https  = { &map_sshtun, "www.snitch", IN6ADDR_LOOPBACK_INIT, 443 };
+struct mapping map_cloud =  { NULL,        "cloud.vanrein.org", { { { 0x20,0x01,0x09,0x80,0x93,0xa5,0x00,0x01,0,0,0,0,0,0,0,0x43 } } }, 443 };
+struct mapping map_krsd =   { &map_cloud,  "krsd.snitch", { { { 0x20,0x01,0x09,0x80,0x93,0xa5,0x00,0x01,0,0,0,0,0,0,0,0x43 } } }, 443 };
+struct mapping map_kdctun = { &map_krsd,   "kdc.snitch",  IN6ADDR_LOOPBACK_INIT, 88 };
+struct mapping map_sshtun = { &map_kdctun, "ssh.snitch",  IN6ADDR_LOOPBACK_INIT, 22 };
+struct mapping map_https  = { &map_sshtun, "www.snitch",  IN6ADDR_LOOPBACK_INIT, 443 };
 
 
 
@@ -105,6 +109,8 @@ int allocate_proxy (pollidx_t idx) {
 		if (newpxy == NULL) {
 			return -1;
 		}
+		proxies = newpxy;
+		proxies_allocated = polls_allocated;
 	}
 	memset (proxies + idx, 0, sizeof (struct proxy));
 	proxies [idx].pollidx = idx;	//TODO// Do we need this? It renumbers!
@@ -165,6 +171,7 @@ void accept_uplink (int sox) {
 		}
 		return;
 	}
+	fprintf (stderr, "Accepted an incoming connection from upstream\n");
 	pfd = allocate_pollfd (cnx, POLLIN | POLLPRI | POLLRDHUP | POLLERR | POLLHUP | POLLNVAL);
 	if (pfd == INVALID_POLLIDX) {
 		fprintf (stderr, "Failed to allocate pollfd for accepted connection\n");
@@ -176,6 +183,7 @@ void accept_uplink (int sox) {
 		close (cnx);
 	}
 	init_upstream_proxy (proxies + pfd);
+	fprintf (stderr, "Successful accept_uplink () -- polls_used=%d, proxies_used=%d\n", polls_used, proxies_used);
 }
 
 /* Connect a client socket for a single connection.
@@ -212,7 +220,6 @@ int connect_downlink (pollidx_t idx, uint8_t *label, size_t labellen) {
 	if (sox2 == -1) {
 		return -1;
 	}
-	socket_unblock (sox2);
 	memset (&sa, 0, sizeof (sa));
 	sa.sin6_family = AF_INET6;
 	memcpy (&sa.sin6_addr, &map->fwdaddr, 16);
@@ -221,10 +228,18 @@ int connect_downlink (pollidx_t idx, uint8_t *label, size_t labellen) {
 		close (sox2);
 		return -1;
 	}
+	socket_unblock (sox2);
+	fprintf (stderr, "Connected to downstream service for %.*s\n", labellen, label);
 	//
 	// Create the new pollfd and proxy structures
 	//
-	idx2 = allocate_pollfd (sox2, POLLIN | POLLPRI | POLLRDHUP | POLLERR | POLLHUP | POLLNVAL);
+	// Since this is a new connection, created because the first TLS record
+	// is to be shipped there, it is setup with both the POLLIN flag and
+	// POLLOUT flag set; POLLIN indicates that its own proxy side is ready
+	// to receive data, POLLOUT indicates that the peer which finished
+	// processing the first TLS record is in the mode to pass that on.
+	//
+	idx2 = allocate_pollfd (sox2, POLLOUT | POLLIN | POLLPRI | POLLRDHUP | POLLERR | POLLHUP | POLLNVAL);
 	if (idx2 == INVALID_POLLIDX) {
 		fprintf (stderr, "Closing down failing connections (no pollfd)\n");
 		close (sox2);
@@ -241,38 +256,46 @@ int connect_downlink (pollidx_t idx, uint8_t *label, size_t labellen) {
 		return -1;
 	}
 	//
-	// Setup proxymap and peeridx values for this second side
+	// Setup proxymap, peeridx and flags values for this second side
 	//
 	proxies [idx2].proxymap = map;
-	proxies [idx2].peeridx = idx;
+	proxies [idx2].peeridx = idx ;
+	proxies [idx ].peeridx = idx2;
+	init_dnstream_proxy (proxies + idx2);
+	fprintf (stderr, "Successful connect_downlink () -- polls_used=%d, proxies_used=%d\n", polls_used, proxies_used);
 	return 0;
 }
 
 /* Shutdown one side of the proxy communication link. */
 void shutdown_proxy (pollidx_t idx) {
-	if (proxies [idx].peeridx != INVALID_POLLIDX) {
-		//TODO// shutdown_proxy (proxies [idx]);
-		proxies [proxies [idx].peeridx].peeridx = INVALID_POLLIDX;
+	pollidx_t peeridx = proxies [idx].peeridx;
+	if (peeridx != INVALID_POLLIDX) {
+		proxies [peeridx].peeridx = INVALID_POLLIDX;
+		shutdown_proxy (peeridx);
 	}
 	close (polls [idx].fd);
 	free_pollfd (idx);
 	free_proxy (idx);
+	fprintf (stderr, "Successful shutdown_proxy () -- polls_used=%d, proxies_used=%d\n", polls_used, proxies_used);
 }
 
 
 /* The first TLS record is received over a proxy with an invalid peeridx.
  * When this arrives, scan for the label and use it to connect to the
  * other end of the requested connection, or set this one to error mode.
+ * Return -1 on error, or 0 on success.
  */
-void process_record1 (pollidx_t idx) {
-	uint8_t *label;
+int process_record1 (pollidx_t idx) {
+	uint8_t *label = NULL;
 	size_t labellen;
 	bool error = true;
 	assert (proxies [idx].peeridx == INVALID_POLLIDX);
+	if (!proxy_sends (proxies + idx)) {
+		return -1;
+	}
 	record_label (proxies [idx].rdbuf, proxies [idx].read, &label, &labellen);
 	if (label) {
 		if (connect_downlink (idx, label, labellen) != -1) {
-			init_dnstream_proxy (proxies + idx);
 			error = false;
 		} else {
 			perror ("Failure connecting downstream");
@@ -282,6 +305,9 @@ void process_record1 (pollidx_t idx) {
 	}
 	if (error) {
 		set_proxymode (proxies + idx, PROXY_MODE_ERROR);
+		return -1;
+	} else {
+		return 0;
 	}
 }
 
@@ -289,39 +315,111 @@ void process_record1 (pollidx_t idx) {
 void daemon (void) {
 	while (poll (polls, polls_used, -1) > 0) {
 		int idx;
+		//
+		// Process new incoming connections on the server socket
+		//
 		if (polls [0].revents & POLLIN) {
-			accept_uplink (0);
+			accept_uplink (polls [0].fd);
 			polls [0].revents &= ~POLLIN;
+			// Continue general processing (for errors)
 		}
+		//
+		// Iterate over sockets and process events
+		//
 		for (idx = 0; idx < polls_used; idx++) {
-			bool workdone = false;
+			//
+			// Process errors, if any
+			//
 			if (polls [idx].revents & (POLLRDHUP | POLLERR | POLLHUP | POLLNVAL)) {
 				shutdown_proxy (idx);
-			} else if (polls [idx].revents & POLLIN) {
-				recv_downstream (proxies + idx);
+				polls [idx].revents &= ~ ( POLLIN | POLLOUT );
+			}
+			//
+			// Process any incoming data
+			//
+			// This is not really complex; the proxy side and the
+			// incoming file descriptor are found at the same
+			// index.  So the pollfd's file descriptor and the
+			// rdbuf, read, written values all reside in the
+			// pollfd and proxies structures at idx.
+			//
+			if (polls [idx].revents & POLLIN) {
+				recv_record (polls [idx].fd, proxies + idx);
+				// Done receiving on this proxy side?
 				if (!proxy_recvs (proxies + idx)) {
-					if (proxies [idx].peeridx == INVALID_POLLIDX) {
-						process_record1 (idx);
-					}
-					if (proxy_sends (proxies + idx)) {
-						polls [idx].events = (polls [idx].events & ~POLLIN) | POLLOUT;
-					} else {
+					polls [idx].events &= ~POLLIN;
+					// Ended in error on this proxy side?
+					if (!proxy_sends (proxies + idx)) {
 						shutdown_proxy (idx);
+					// ...or sending the first TLS record?
+					} else if (proxies [idx].peeridx == INVALID_POLLIDX) {
+						// Construct peer, with POLLOUT
+						if (process_record1 (idx) == -1) {
+							shutdown_proxy (idx);
+						}
+					// ...or sending a further TLS record?
+					} else {
+						// Setup sending in the peer
+						polls [proxies [idx].peeridx].events |= POLLOUT;
 					}
-					workdone = true;
 				}
-			} else if (polls [idx].revents & POLLOUT) {
-				send_downstream (proxies + idx);
-				if (!proxy_sends (proxies + idx)) {
-					if (proxy_recvs (proxies + idx)) {
-						polls [idx].events = (polls [idx].events & ~POLLOUT) | POLLIN;
+			}
+			//
+			// Process any opportunity to send.
+			//
+			// POLLOUT is possible if the peer's proxy state is
+			// currently sending (so, not receiving).  The data
+			// (rdbuf, read, written) is found at the peer, and
+			// the only thing found at the current index is the
+			// POLLOUT event on this side's file descriptor.
+			//
+			if (polls [idx].revents & POLLOUT) {
+				pollidx_t origin = proxies [idx].peeridx;
+				send_record (polls [idx].fd, proxies + origin);
+				// Done sending from the peer proxy side?
+				if (!proxy_sends (proxies + origin)) {
+					polls [idx].events &= ~POLLOUT;
+					// Now receiving on the peer proxy side?
+					if (proxy_recvs (proxies + origin)) {
+						polls [origin].events |= POLLIN;
+					// ...or did it end in error?
 					} else {
-						shutdown_proxy (idx);
+						shutdown_proxy (origin);
 					}
 				}
 			}
 		}
 	}
+	//
+	// Coming here, poll () must have been terminated by a signal
+	//
+	if (interrupted) {
+		fprintf (stderr, "\nInterrupted\n");
+	}
+}
+
+/* Cleanup by closing any open sockets */
+void cleanup (void) {
+	if (polls) {
+		int idx;
+		for (idx = polls_used-1; idx >= 0; idx--) {
+			if (polls [idx].fd != -1) {
+				close (polls [idx].fd);
+			}
+		}
+		free (polls);
+		polls = NULL;
+	}
+	if (proxies) {
+		free (proxies);
+		proxies = NULL;
+	}
+	fprintf (stderr, "Cleaned up sockets, freed memory for polls and proxies\n");
+}
+
+/* Interrupt the program to tear it down with grace */
+void interrupt_program (int sig) {
+	interrupted = true;
 }
 
 /* Main program */
@@ -363,10 +461,12 @@ int main (int argc, char *argv []) {
 	memcpy (&sa.sin6_addr, &setting_addr, 16);
 	if (bind (sox, (struct sockaddr *) &sa, sizeof (sa)) == -1) {
 		perror ("Failed to bind socket");
+		close (sox);
 		exit (1);
 	}
 	if (listen (sox, 5) == -1) {
 		perror ("Failed to listen to bound socket");
+		close (sox);
 		exit (1);
 	}
 	//
@@ -374,18 +474,32 @@ int main (int argc, char *argv []) {
 	//
 	if (allocate_pollfd (sox, POLLIN) != 0) {
 		fprintf (stderr, "%s: Failure to initiate incoming polling structure\n");
+		close (sox);
 		exit (1);
 	}
 	if (allocate_proxy (0) != 0) {
 		fprintf (stderr, "%s: Failure to initiate proxy structures\n");
+		free (polls);
+		polls = NULL;
+		close (sox);
 		exit (1);
 	}
+	//
+	// Cleanup.
+	//
+	atexit (cleanup);
+	//
+	// Signals.
+	//
+	signal (SIGINT, interrupt_program);
+	signal (SIGKILL, interrupt_program);
+	signal (SIGABRT, interrupt_program);
 	//
 	// TODO: Daemon.
 	//
 	daemon ();
 	//
-	// Cleanup.
+	// Terminate.
 	//
-	close (sox);
+	exit (interrupted? 1: 0);
 }

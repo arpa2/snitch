@@ -7,6 +7,11 @@
 /********** STRUCTURES **********/
 
 
+/* Distinguish indexes into the pollfd sequence as a special type. */
+typedef unsigned int pollidx_t;
+#define INVALID_POLLIDX ((pollidx_t) -1)
+
+
 /* A configured mapping, labeled and with a particular downlink. */
 struct mapping {
 	struct mapping *next;
@@ -22,25 +27,43 @@ struct mapping {
 #define PROXY_MODE_SEND		0x0001
 #define PROXY_MODE_ERROR	0x0003
 
-#define set_upstream_proxymode(pxy,m) (((pxy)->upflags = ((pxy)->upflags & ~PROXY_MODE_MASK) | (m)))
-#define set_dnstream_proxymode(pxy,m) (((pxy)->dnflags = ((pxy)->dnflags & ~PROXY_MODE_MASK) | (m)))
+#define PROXY_SIDE_UPSTREAM	0x0010
 
-#define init_dnstream_proxy(pxy) { (pxy)->upflags = PROXY_MODE_RECV; }
-#define init_upstream_proxy(pxy) { (pxy)->upflags = PROXY_MODE_RECV; }
+#define set_proxymode(pxy,m) (((pxy)->flags = ((pxy)->flags & ~PROXY_MODE_MASK) | (m)))
+#define proxymode(pxy,m) ((pxy)->flags & ~PROXY_MODE_MASK)
 
-#define proxy_sends_upstream(pxy) (((pxy)->upflags & PROXY_MODE_MASK) == PROXY_MODE_SEND)
-#define proxy_recvs_upstream(pxy) (((pxy)->upflags & PROXY_MODE_MASK) == PROXY_MODE_RECV)
-#define proxy_sends_dnstream(pxy) (((pxy)->dnflags & PROXY_MODE_MASK) == PROXY_MODE_SEND)
-#define proxy_recvs_dnstream(pxy) (((pxy)->dnflags & PROXY_MODE_MASK) == PROXY_MODE_RECV)
+#define init_dnstream_proxy(pxy) { (pxy)->flags = PROXY_MODE_RECV; }
+#define init_upstream_proxy(pxy) { (pxy)->flags = PROXY_MODE_RECV | PROXY_SIDE_UPSTREAM; }
+
+#define proxy_sends(pxy) (((pxy)->flags & PROXY_MODE_MASK) == PROXY_MODE_SEND)
+#define proxy_recvs(pxy) (((pxy)->flags & PROXY_MODE_MASK) == PROXY_MODE_RECV)
+#define proxy_side_upstream(pxy) (((pxy)->flags & PROXY_SIDE_UPSTREAM) == PROXY_SIDE_UPSTREAM)
+#define proxy_side_dnstream(pxy) (((pxy)->flags & PROXY_SIDE_UPSTREAM) != PROXY_SIDE_UPSTREAM)
 
 
-/* The structure of a bidirectional proxy, upstream & downstream. */
+/* The structure of a one-sided proxy, upstream & downstream.
+ * These structures are indexed with the pollidx fields, which match
+ * the values to the pollfd structures holding the file descriptors.
+ * The peerdix fields couple two one-sided proxy into a bidirectional
+ * proxy structure.
+ *
+ * Note that freeing pollfd structures may lead to some rearranging of
+ * the pollidx and peeridx values, so no further state storage than in
+ * these structures is possible, at least not acress pollfd_free() calls.
+ *
+ * Note that in initial and terminal stages, it is possible that peerdix
+ * values are set to INVALID_POLLFD.
+ */
 struct proxy {
 	struct mapping *proxymap;
+	pollidx_t pollidx, peeridx;
+	uint16_t flags;
+	uint8_t rdbuf [MAXRECLEN];
+	size_t read, written;
+	//TODO:DEPRECATE:BIDIRSETTINGS//
 	int upstream, dnstream;
 	size_t upread, dnwritten;
 	size_t dnread, upwritten;
-	uint16_t upflags, dnflags;
 	uint8_t upbuf [MAXRECLEN], dnbuf [MAXRECLEN];
 };
 

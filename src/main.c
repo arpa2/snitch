@@ -6,18 +6,27 @@
 #include <stdlib.h>
 #include <stdarg.h>
 #include <stdint.h>
+#include <stdbool.h>
 #include <stdio.h>
 #include <string.h>
+#include <assert.h>
 
 #include <sys/types.h>
 #include <sys/socket.h>
 #include <sys/ioctl.h>
 
+#include <poll.h>
 #include <fcntl.h>
 #include <errno.h>
 #include <netinet/in.h>
 
 #include "fun.h"
+
+
+/* Linux specific bit; setting it to 0 makes code skip those sections */
+#ifndef POLLRDHUP
+#define POLLRDHUP 0
+#endif
 
 
 /* Commandline parameters */
@@ -27,13 +36,89 @@ char *setting_cfgfile = "/etc/snitch.conf";
 
 
 
-/* Mapping structures */
+/* Global variables */
+struct pollfd *polls = NULL;
+pollidx_t polls_used = 0;
+pollidx_t polls_allocated = 0;
+struct proxy *proxies = NULL;
+pollidx_t proxies_allocated = 0;
+#define proxies_used polls_used
 //TODO// Read from configfiles
 //TODO// Use hashing based on label
 struct mapping map_kdctun = { NULL,        "kdc.snitch", IN6ADDR_LOOPBACK_INIT, 88 };
 struct mapping map_sshtun = { &map_kdctun, "ssh.snitch", IN6ADDR_LOOPBACK_INIT, 22 };
 struct mapping map_https  = { &map_sshtun, "www.snitch", IN6ADDR_LOOPBACK_INIT, 443 };
 
+
+
+/* Allocate a polling entry; return INVALID_POLLIDX on failure. */
+pollidx_t allocate_pollfd (int fd, short events) {
+	if (polls_used == polls_allocated) {
+		struct pollfd *newpolls = realloc (polls, (polls_allocated + 100) * sizeof (struct pollfd));
+		if (!newpolls) {
+			return INVALID_POLLIDX;
+		}
+		polls = newpolls;
+		polls_allocated += 100;
+	}
+	polls [polls_used].fd = fd;
+	polls [polls_used].events = events;
+	polls [polls_used].revents = 0;
+	return polls_used++;
+}
+
+/* Free a polling entry */
+//TODO// Mark entries for garbage collection or reuse and skip renumbering?
+void free_pollfd (pollidx_t idx) {
+	int old;
+	assert (idx <= polls_used);
+	assert (idx != INVALID_POLLIDX);
+	old = polls_used - 1;
+	if (idx < old) {
+		int ctr;
+		memcpy (&polls [idx], &polls [old], sizeof (struct pollfd));
+		for (ctr = 0; ctr < polls_used-1; ctr++) {
+			if (proxies [ctr].pollidx == old) {
+				proxies [ctr].pollidx = idx;
+			}
+			if (proxies [ctr].peeridx == old) {
+				proxies [ctr].peeridx = idx;
+			}
+		}
+	}
+	polls_used--;
+}
+
+/* Allocate a proxy entry for a given pollidx_t value.  The idea is to call
+ * this with the pollidx_t returned from allocate_pollfd(), and always call
+ * this right afterwards to allocate control structures.
+ * Each proxy structure reflects one side of the proxying relationship.
+ * When this function fails, it returns -1 and otherwise it returns the
+ * idx it got sent.  In case of error, you should not continue to rely on
+ * the pollfd either, if your program assumes that they work together.
+ */
+int allocate_proxy (pollidx_t idx) {
+	assert (idx <= polls_used);
+	assert (idx != INVALID_POLLIDX);
+	if (idx >= proxies_allocated) {
+		struct proxy *newpxy = realloc (proxies, polls_allocated * sizeof (struct proxy));
+		if (newpxy == NULL) {
+			return -1;
+		}
+	}
+	memset (proxies + idx, 0, sizeof (struct proxy));
+	proxies [idx].pollidx = idx;	//TODO// Do we need this? It renumbers!
+	proxies [idx].peeridx = INVALID_POLLIDX;
+	return idx;
+}
+
+/* Free a proxy entry.  This currently does nothing, but the idea is to call
+ * it sort of "in parallel" with free_pollfd, using the same idx to both but
+ * not minding in what order they are called.
+ */
+void free_proxy (pollidx_t idx) {
+	;
+}
 
 /* Portable function to set a socket into non-blocking mode.  This is a
  * requirement for asynchronous communication, especially for the accept()
@@ -43,7 +128,6 @@ struct mapping map_https  = { &map_sshtun, "www.snitch", IN6ADDR_LOOPBACK_INIT, 
  * Source: http://www.kegel.com/dkftpbench/nonblocking.html
  * Credit: Bjorn Reese
  */
-
 void socket_unblock (int sox) {
 	int retval;
 #ifdef O_NONBLOCK
@@ -67,13 +151,45 @@ void socket_unblock (int sox) {
 }
 
 
+/* Accept a new incoming connection, which counts as the uplink.
+ * While doing this, also ensure that a proxy structure has been allocated.
+ * In case of failure, resolve matters internally and report vigorously.
+ */
+void accept_uplink (int sox) {
+	int cnx;
+	int pfd;
+	cnx = accept (sox, NULL, 0);
+	if (cnx == -1) {
+		if ((errno != EWOULDBLOCK) && (errno != EAGAIN)) {
+			perror ("Incoming connection refused");
+		}
+		return;
+	}
+	pfd = allocate_pollfd (cnx, POLLIN | POLLPRI | POLLRDHUP | POLLERR | POLLHUP | POLLNVAL);
+	if (pfd == INVALID_POLLIDX) {
+		fprintf (stderr, "Failed to allocate pollfd for accepted connection\n");
+		close (cnx);
+	}
+	if (allocate_proxy (pfd) != pfd) {
+		fprintf (stderr, "Failed to allocate proxy for accepted connection");
+		free_pollfd (pfd);
+		close (cnx);
+	}
+	init_upstream_proxy (proxies + pfd);
+}
+
 /* Connect a client socket for a single connection.
  * Returns 0 for success, or -1 for failure (and sets errno).
  */
-int connect_downlink (struct proxy *pxy, uint8_t *label, size_t labellen) {
+int connect_downlink (pollidx_t idx, uint8_t *label, size_t labellen) {
+	int sox2;
+	int idx2;
 	struct mapping *map = &map_https;
 	struct sockaddr_in6 sa;
 	printf ("Connection has label %.*s\n", labellen, label);
+	//
+	// Lookup the map entry with this label
+	//
 	while (map) {
 		if ((memcmp (map->label, label, labellen) == 0) && (map->label [labellen] == 0)) {
 			break;
@@ -84,71 +200,127 @@ int connect_downlink (struct proxy *pxy, uint8_t *label, size_t labellen) {
 		errno = ENOKEY;
 		return -1;
 	}
-	pxy->proxymap = map;
+	//
+	// Assign the map to the existing upstream side
+	//
+	proxies [idx].proxymap = map;
+	//
+	// Connect to the downstream remote endpoint
+	//
 	printf ("Connecting service to downlink\n");
-	pxy->dnstream = socket (AF_INET6, SOCK_STREAM, 0);
-	socket_unblock (pxy->dnstream);
-	if (pxy->dnstream == -1) {
+	sox2 = socket (AF_INET6, SOCK_STREAM, 0);
+	if (sox2 == -1) {
 		return -1;
 	}
+	socket_unblock (sox2);
 	memset (&sa, 0, sizeof (sa));
 	sa.sin6_family = AF_INET6;
 	memcpy (&sa.sin6_addr, &map->fwdaddr, 16);
 	sa.sin6_port = htons (map->fwdport);
-	if (connect (pxy->dnstream, (struct sockaddr *) &sa, sizeof (sa)) == -1) {
-		close (pxy->dnstream);
-		pxy->dnstream = -1;
+	if (connect (sox2, (struct sockaddr *) &sa, sizeof (sa)) == -1) {
+		close (sox2);
 		return -1;
 	}
+	//
+	// Create the new pollfd and proxy structures
+	//
+	idx2 = allocate_pollfd (sox2, POLLIN | POLLPRI | POLLRDHUP | POLLERR | POLLHUP | POLLNVAL);
+	if (idx2 == INVALID_POLLIDX) {
+		fprintf (stderr, "Closing down failing connections (no pollfd)\n");
+		close (sox2);
+		close (polls [idx].fd);
+		free_pollfd (idx);
+		return -1;
+	}
+	if (allocate_proxy (idx2) != idx2) {
+		fprintf (stderr, "Closing down failing connections (no proxy)\n");
+		close (sox2);
+		close (polls [idx].fd);
+		free_pollfd (idx2);
+		free_pollfd (idx);
+		return -1;
+	}
+	//
+	// Setup proxymap and peeridx values for this second side
+	//
+	proxies [idx2].proxymap = map;
+	proxies [idx2].peeridx = idx;
 	return 0;
 }
 
+/* Shutdown one side of the proxy communication link. */
+void shutdown_proxy (pollidx_t idx) {
+	if (proxies [idx].peeridx != INVALID_POLLIDX) {
+		//TODO// shutdown_proxy (proxies [idx]);
+		proxies [proxies [idx].peeridx].peeridx = INVALID_POLLIDX;
+	}
+	close (polls [idx].fd);
+	free_pollfd (idx);
+	free_proxy (idx);
+}
+
+
+/* The first TLS record is received over a proxy with an invalid peeridx.
+ * When this arrives, scan for the label and use it to connect to the
+ * other end of the requested connection, or set this one to error mode.
+ */
+void process_record1 (pollidx_t idx) {
+	uint8_t *label;
+	size_t labellen;
+	bool error = true;
+	assert (proxies [idx].peeridx == INVALID_POLLIDX);
+	record_label (proxies [idx].rdbuf, proxies [idx].read, &label, &labellen);
+	if (label) {
+		if (connect_downlink (idx, label, labellen) != -1) {
+			init_dnstream_proxy (proxies + idx);
+			error = false;
+		} else {
+			perror ("Failure connecting downstream");
+		}
+	} else {
+		printf ("DID NOT find a label, will shutdown upstream\n");
+	}
+	if (error) {
+		set_proxymode (proxies + idx, PROXY_MODE_ERROR);
+	}
+}
+
 /* Daemon control loop */
-int daemon (int sox) {
-	int cnx;
-	while (cnx = accept (sox, NULL, 0), cnx != -1) {
-		uint8_t *label;
-		size_t labellen;
-		struct proxy *pxy = malloc (sizeof (*pxy));
-		printf ("Accepted new connection from upstream\n");
-		if (!pxy) {
-			perror ("Could not allocate proxy buffer");
-			close (cnx);
-			continue;
+void daemon (void) {
+	while (poll (polls, polls_used, -1) > 0) {
+		int idx;
+		if (polls [0].revents & POLLIN) {
+			accept_uplink (0);
+			polls [0].revents &= ~POLLIN;
 		}
-		pxy->upstream = cnx;
-		pxy->dnstream = -1;
-		pxy->upread = pxy->dnwritten = pxy->dnread = pxy->upwritten = 0;
-		init_dnstream_proxy (pxy);
-		socket_unblock (pxy->upstream);
-		//TODO// Synchronous read; moving towards poll()
-		while (proxy_recvs_dnstream (pxy)) {
-			recv_downstream (pxy);
-			printf ("Received %d bytes total downstream\n", pxy->dnread);
-		}
-		if (proxy_sends_dnstream (pxy)) {
-			printf ("Ready to send bytes downstream\n");
-		} else {
-			printf ("NOT ready to send bytes downstream\n");
-		}
-		record_label (pxy->dnbuf, pxy->dnread, &label, &labellen);
-		if (label) {
-			if (connect_downlink (pxy, label, labellen) != -1) {
-				init_upstream_proxy (pxy);
-				//TODO// Sync write; moving towards poll()
-				while (proxy_sends_dnstream (pxy)) {
-					send_downstream (pxy);
-					printf ("Sent %d bytes total downstream\n", pxy->dnwritten);
+		for (idx = 0; idx < polls_used; idx++) {
+			bool workdone = false;
+			if (polls [idx].revents & (POLLRDHUP | POLLERR | POLLHUP | POLLNVAL)) {
+				shutdown_proxy (idx);
+			} else if (polls [idx].revents & POLLIN) {
+				recv_downstream (proxies + idx);
+				if (!proxy_recvs (proxies + idx)) {
+					if (proxies [idx].peeridx == INVALID_POLLIDX) {
+						process_record1 (idx);
+					}
+					if (proxy_sends (proxies + idx)) {
+						polls [idx].events = (polls [idx].events & ~POLLIN) | POLLOUT;
+					} else {
+						shutdown_proxy (idx);
+					}
+					workdone = true;
 				}
-				close (pxy->dnstream);
-			} else {
-				perror ("Failure connecting downstream");
+			} else if (polls [idx].revents & POLLOUT) {
+				send_downstream (proxies + idx);
+				if (!proxy_sends (proxies + idx)) {
+					if (proxy_recvs (proxies + idx)) {
+						polls [idx].events = (polls [idx].events & ~POLLOUT) | POLLIN;
+					} else {
+						shutdown_proxy (idx);
+					}
+				}
 			}
-		} else {
-			printf ("DID NOT find a label\n");
 		}
-		close (pxy->upstream);
-		free (pxy);
 	}
 }
 
@@ -180,11 +352,11 @@ int main (int argc, char *argv []) {
 	// Socket.
 	//
 	sox = socket (AF_INET6, SOCK_STREAM, 0);
-	//TODO:NOTYET,while(accept)...// socket_unblock (sox);
 	if (sox == -1) {
 		perror ("Failed to allocate a server socket");
 		exit (1);
 	}
+	socket_unblock (sox);
 	memset (&sa, 0, sizeof (sa));
 	sa.sin6_family = AF_INET6;
 	sa.sin6_port = htons (setting_port);
@@ -198,9 +370,20 @@ int main (int argc, char *argv []) {
 		exit (1);
 	}
 	//
+	// Setup first polling entry with accept() socket
+	//
+	if (allocate_pollfd (sox, POLLIN) != 0) {
+		fprintf (stderr, "%s: Failure to initiate incoming polling structure\n");
+		exit (1);
+	}
+	if (allocate_proxy (0) != 0) {
+		fprintf (stderr, "%s: Failure to initiate proxy structures\n");
+		exit (1);
+	}
+	//
 	// TODO: Daemon.
 	//
-	daemon (sox);
+	daemon ();
 	//
 	// Cleanup.
 	//
